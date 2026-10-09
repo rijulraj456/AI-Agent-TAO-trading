@@ -1,0 +1,131 @@
+import os, time, logging
+from datetime import datetime
+import ccxt
+import pandas as pd
+import numpy as np
+from dotenv import load_dotenv
+
+load_dotenv()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+
+SYMBOL = "TAO/USDT"
+TIMEFRAME = "15m"
+PAPER = True                    # set False only after testing
+RISK_PCT = 0.01                 # 1% of equity per trade
+STOP_PCT = 0.03
+TP_PCT = 0.06
+MAX_DAILY_LOSS_PCT = 0.05
+
+exchange = ccxt.binance({
+    "apiKey": os.getenv("BINANCE_KEY", ""),
+    "secret": os.getenv("BINANCE_SECRET", ""),
+    "enableRateLimit": True,
+    "options": {"defaultType": "spot"},
+})
+
+class TaoAgent:
+    def __init__(self):
+        self.equity = 10_000.0          # paper starting equity (USDT)
+        self.position = 0.0             # TAO held
+        self.entry = None
+        self.daily_pnl = 0.0
+        self.day = datetime.utcnow().date()
+
+    def fetch(self, limit=200):
+        ohlcv = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=limit)
+        df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
+        df["ts"] = pd.to_datetime(df["ts"], unit="ms")
+        return df
+
+    def indicators(self, df):
+        c = df["close"]
+        df["sma_fast"] = c.rolling(10).mean()
+        df["sma_slow"] = c.rolling(40).mean()
+        delta = c.diff()
+        gain = delta.clip(lower=0).rolling(14).mean()
+        loss = (-delta.clip(upper=0)).rolling(14).mean()
+        rs = gain / loss.replace(0, np.nan)
+        df["rsi"] = 100 - (100 / (1 + rs))
+        ema12 = c.ewm(span=12).mean()
+        ema26 = c.ewm(span=26).mean()
+        df["macd"] = ema12 - ema26
+        df["macd_sig"] = df["macd"].ewm(span=9).mean()
+        df["atr"] = (df["high"] - df["low"]).rolling(14).mean()
+        return df
+
+    def signal(self, row, prev):
+        # Simple confluence: trend + momentum. Replace with your model or LLM call.
+        bull = (
+            row.sma_fast > row.sma_slow
+            and prev.sma_fast <= prev.sma_slow
+            and row.rsi < 70
+            and row.macd > row.macd_sig
+        )
+        bear = (
+            row.sma_fast < row.sma_slow
+            and prev.sma_fast >= prev.sma_slow
+            and row.rsi > 30
+            and row.macd < row.macd_sig
+        )
+        if bull:
+            return "BUY", 0.7, "SMA cross up + MACD positive, RSI not overbought"
+        if bear:
+            return "SELL", 0.7, "SMA cross down + MACD negative, RSI not oversold"
+        return "HOLD", 0.0, "no confluence"
+
+    def size(self, price):
+        risk_usd = self.equity * RISK_PCT
+        qty = risk_usd / (price * STOP_PCT)
+        return max(qty, 0.0)
+
+    def reset_day(self):
+        today = datetime.utcnow().date()
+        if today != self.day:
+            self.daily_pnl = 0.0
+            self.day = today
+
+    def step(self):
+        self.reset_day()
+        if self.daily_pnl <= -self.equity * MAX_DAILY_LOSS_PCT:
+            logging.warning("Daily loss limit hit — pausing")
+            return
+
+        df = self.indicators(self.fetch())
+        row, prev = df.iloc[-1], df.iloc[-2]
+        price = float(row.close)
+        action, conf, reason = self.signal(row, prev)
+        logging.info(f"price={price:.2f} rsi={row.rsi:.1f} action={action} ({reason})")
+
+        # Stops / targets on open position
+        if self.position > 0 and self.entry:
+            if price <= self.entry * (1 - STOP_PCT) or price >= self.entry * (1 + TP_PCT):
+                pnl = (price - self.entry) * self.position
+                self.equity += pnl
+                self.daily_pnl += pnl
+                logging.info(f"EXIT @ {price:.2f} pnl={pnl:.2f} equity={self.equity:.2f}")
+                self.position, self.entry = 0.0, None
+                return
+
+        if action == "BUY" and self.position == 0 and conf >= 0.6:
+            qty = self.size(price)
+            if PAPER:
+                self.position, self.entry = qty, price
+                logging.info(f"PAPER BUY {qty:.4f} TAO @ {price:.2f}")
+            else:
+                # exchange.create_market_buy_order(SYMBOL, qty)
+                logging.info("LIVE buy skipped in sample — wire order here")
+        elif action == "SELL" and self.position > 0:
+            pnl = (price - self.entry) * self.position
+            self.equity += pnl
+            self.daily_pnl += pnl
+            logging.info(f"PAPER SELL pnl={pnl:.2f} equity={self.equity:.2f}")
+            self.position, self.entry = 0.0, None
+
+if __name__ == "__main__":
+    agent = TaoAgent()
+    while True:
+        try:
+            agent.step()
+        except Exception as e:
+            logging.exception(e)
+        time.sleep(60)   # align to your timeframe
